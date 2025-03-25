@@ -349,6 +349,8 @@ async def set_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     config.set_custom_prompt(prompt_text)  # Sets mode to custom automatically
     await update.message.reply_text("✅ Custom prompt set.  Now send a file or image.", parse_mode="Markdown")
 
+# Replace the existing `process_text_and_generate_output` function with this updated version:
+
 async def process_text_and_generate_output(update: Update, context: ContextTypes.DEFAULT_TYPE, text_content: str):
     """Processes the extracted text and generates the quiz or output."""
     # Use query.message for consistency, even if it's from a callback
@@ -358,7 +360,6 @@ async def process_text_and_generate_output(update: Update, context: ContextTypes
         message = update.message
 
     progress_msg = await message.reply_text("🔄 **Processing...**", parse_mode="Markdown")
-
 
     try:
         text_content = clean_text(text_content)
@@ -373,12 +374,14 @@ async def process_text_and_generate_output(update: Update, context: ContextTypes
             await progress_msg.edit_text(f"🔄 **Progress:** Processing chunk {i + 1}/{total_chunks}...", parse_mode="Markdown")
             output_text += generate_content(chunk) + "\n\n"
 
-            # Cooldown for 'pro' models
-            if config.is_pro_model() and i < total_chunks - 1:
+            # Cooldown logic: Apply 30-40 seconds wait only for 'pro' models, skip for 'flash' models
+            if config.is_pro_model() and i < total_chunks - 1:  # Only wait if not the last chunk
+                wait_time = random.uniform(30, 40)  # Random wait between 30 and 40 seconds
                 await progress_msg.edit_message_text(
-                    f"⏳ **Waiting:** Chunk {i + 1}/{total_chunks} complete.  {config.pro_model_cooldown} second cooldown...",
-                    parse_mode="Markdown")
-                time.sleep(config.pro_model_cooldown)
+                    f"⏳ **Waiting:** Chunk {i + 1}/{total_chunks} complete. Waiting {wait_time:.1f} seconds due to rate limits...",
+                    parse_mode="Markdown"
+                )
+                time.sleep(wait_time)
 
         if config.mode == "mcq":
             mcqs = parse_mcq(output_text)
@@ -388,15 +391,15 @@ async def process_text_and_generate_output(update: Update, context: ContextTypes
 
             await progress_msg.edit_text(f"✅ **MCQ Quiz Ready!** ({len(mcqs)} questions)", parse_mode="Markdown")
             for i, mcq in enumerate(mcqs, 1):
-                # Logging (optional, but very useful for debugging)
                 logger.info(
-                    f"Poll {i}: Q: {mcq['question']} | Options: {mcq['options']} | Correct: {mcq['correct']} | E: {mcq['explanation']}")
+                    f"Poll {i}: Q: {mcq['question']} | Options: {mcq['options']} | Correct: {mcq['correct']} | E: {mcq['explanation']}"
+                )
                 logger.info(
-                    f"Lengths - Q: {len(mcq['question'])}, Options: {[len(opt) for opt in mcq['options']]}, E: {len(mcq['explanation'])}")
+                    f"Lengths - Q: {len(mcq['question'])}, Options: {[len(opt) for opt in mcq['options']]}, E: {len(mcq['explanation'])}"
+                )
 
-                # Truncate and validate lengths (important for Telegram API limits)
                 question = mcq['question'][:256]
-                options = [opt[:100] for opt in mcq['options']][:10]  # Max 10 options
+                options = [opt[:100] for opt in mcq['options']][:10]
                 explanation = mcq['explanation'][:1024]
 
                 if len(question) > 256 or any(len(opt) > 100 for opt in options) or len(explanation) > 1024:
@@ -415,16 +418,14 @@ async def process_text_and_generate_output(update: Update, context: ContextTypes
                     )
                 except Exception as e:
                     logger.error(f"Poll {i} error: {e}")
-                    # Fallback to text output
-                    await send_text_fallback(message, mcq, i, e) # Pass message
-
+                    await send_text_fallback(message, mcq, i, e)
 
         elif config.mode == "qa":
             qas = parse_qa(output_text)
             if not qas:
                 await progress_msg.edit_text("❌ Error parsing Q&A. Check prompt.", parse_mode="Markdown")
                 return
-            await send_formatted_qa(message, qas, progress_msg)  # Use formatted output.
+            await send_formatted_qa(message, qas, progress_msg)
 
         elif config.mode == "custom":
             await send_formatted_custom(message, output_text, progress_msg)
