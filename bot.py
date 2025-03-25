@@ -3,6 +3,7 @@ import re
 import time
 import logging
 import io
+import random
 from typing import Dict, List, Union
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Poll
@@ -17,12 +18,14 @@ from telegram.ext import (
 import google.generativeai as genai
 from pdf2image import convert_from_path
 from PIL import Image
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph
+from reportlab.lib.styles import getSampleStyleSheet
 
 # --- Configuration and Setup ---
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-
 
 class Config:
     """Configuration for the Gemini API and bot behavior."""
@@ -79,18 +82,15 @@ class Config:
             logger.warning("API key not set.  Gemini model not initialized.")
             self.model = None
 
-
     def set_api_key(self, api_key: str):
         """Sets the API key and re-initializes the Gemini model."""
         self.api_key = api_key
         self.initialize_model()
 
-
     def set_model(self, model_name: str):
         """Changes the Gemini model used for generation."""
         self.model_name = model_name
         self.initialize_model()  # Re-initialize with the new model
-
 
     def set_mode(self, mode: str):
         """Sets the processing mode ('mcq', 'qa', 'custom')."""
@@ -105,7 +105,6 @@ class Config:
 
     def get_prompt(self, text: str) -> str:
         """Retrieves the appropriate prompt based on the current mode."""
-
         if self.mode == "custom":
             return self.custom_prompt + "\nText:\n{text}".format(text=text)
         elif self.mode in self.prompts:
@@ -127,16 +126,13 @@ config = Config()
 
 AVAILABLE_MODELS = [
     {"full": "gemini-1.5-pro-latest", "short": "1.5-pro-latest"},
-    {"full": "gemini-1.0-pro", "short": "1.0-pro"},
     {"full": "gemini-1.5-flash", "short": "1.5-flash"},
     {"full": "models/gemini-2.0-flash-exp", "short": "2.0-flash-exp"},
     {"full": "models/gemini-2.0-flash", "short": "2.0-flash"},
-    {"full": "models/gemini-2.0-flash-001", "short": "2.0-flash-001"},
     {"full": "models/gemini-2.0-flash-exp-image-generation", "short": "2.0-flash-exp-img"},
     {"full": "models/gemini-2.0-flash-lite-001", "short": "2.0-flash-lite-001"},
     {"full": "models/gemini-2.0-flash-lite", "short": "2.0-flash-lite"},
     {"full": "models/gemini-2.0-flash-lite-preview-02-05", "short": "2.0-flash-lite-p-0205"},
-    {"full": "models/gemini-2.0-flash-lite-preview", "short": "2.0-flash-lite-p"},
     {"full": "models/gemini-2.0-pro-exp", "short": "2.0-pro-exp"},
     {"full": "models/gemini-2.0-pro-exp-02-05", "short": "2.0-pro-exp-0205"},
     {"full": "models/gemini-exp-1206", "short": "exp-1206"},
@@ -144,8 +140,6 @@ AVAILABLE_MODELS = [
     {"full": "models/gemini-2.0-flash-thinking-exp", "short": "2.0-flash-think-exp"},
     {"full": "models/gemini-2.0-flash-thinking-exp-1219", "short": "2.0-flash-think-1219"}
 ]
-
-
 
 # --- Utility Functions ---
 
@@ -189,7 +183,6 @@ def generate_content(text_chunk: str) -> str:
         logger.error(f"Error generating questions: {e}")
         return f"❌ Error: {e}"
 
-
 def parse_mcq(text: str) -> List[Dict[str, Union[str, List[str], int]]]:
     """Parses MCQ output from Gemini into a structured list of dictionaries."""
     mcqs = []
@@ -211,7 +204,7 @@ def parse_mcq(text: str) -> List[Dict[str, Union[str, List[str], int]]]:
 def parse_qa(text: str) -> List[Dict[str, str]]:
     """Parses simple Q&A output."""
     qas = []
-    pattern = r"\*\*Q:\*\* (.+?) \| \*\*A:\*\* (.+?) \| \*\*E:\*\* (.+?)(?=\n\*\*Q:\*\*|$)"
+    pattern = r"\*\*Q:\*\* (.+?) \| \*\*A:\*\* (.+?) \| \*\*E:\*\* (.+?)(?=\n\*\*Q:\*\*|])"
     matches = re.finditer(pattern, text, re.DOTALL)
     for match in matches:
         question = match.group(1).strip()
@@ -220,7 +213,10 @@ def parse_qa(text: str) -> List[Dict[str, str]]:
         qas.append({"question": question, "answer": answer, "explanation": explanation})
     return qas
 
-
+def get_progress_bar(progress, total, length=10):
+    """Generates a progress bar string."""
+    filled = int(length * progress / total)
+    return "█" * filled + "░" * (length - filled)
 
 # --- Telegram Bot Handlers ---
 
@@ -286,42 +282,47 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles button presses (for model selection and processing options)."""
     query = update.callback_query
     await query.answer()
-    # Removed:  query.message.reply_to_message.text  # This caused the error.
 
     if query.data.startswith("model_"):
-        model_name = query.data[len("model_") :]
+        model_name = query.data[len("model_"):]
         config.set_model(model_name)
         await query.edit_message_text(
             f"✅ Model `{model_name}` set. Now send a file or image.", parse_mode="Markdown"
         )
-        return # Added return to prevent further processing
+        return
 
-    # Use context.user_data to get the stored text content
     text_content = context.user_data.get("text_content")
     if not text_content:
         await query.edit_message_text("❌ No text content found. Please send the file/image again.", parse_mode="Markdown")
         return
 
     if query.data == "ocr":
-        # OCR and send as text file
         if text_content:
             with open("ocr_output.txt", "w", encoding="utf-8") as f:
                 f.write(text_content)
             await context.bot.send_document(chat_id=query.message.chat_id, document=open("ocr_output.txt", "rb"))
-            os.remove("ocr_output.txt")  # Clean up
-            await query.edit_message_text("✅ OCR text sent.", parse_mode="Markdown") # Indicate completion
-
+            os.remove("ocr_output.txt")
+            await query.edit_message_text("✅ OCR text sent.", parse_mode="Markdown")
         else:
             await query.edit_message_text("❌ No OCR text available.", parse_mode="Markdown")
         return
 
     elif query.data in ["mcq", "qa", "custom"]:
-        # Set mode and process
         config.set_mode(query.data)
-        await process_text_and_generate_output(update, context, text_content)  # Pass context and text_content
-        # await query.message.delete() #Removed to show generated content
-        return # Added return to prevent further processing
+        await process_text_and_generate_output(update, context, text_content)
+        return
 
+    elif query.data == "export_pdf":
+        output_text = context.user_data.get("last_output", "No content available")
+        pdf_path = "quiz_output.pdf"
+        doc = SimpleDocTemplate(pdf_path, pagesize=letter)
+        styles = getSampleStyleSheet()
+        story = [Paragraph(output_text.replace("\n", "<br/>"), styles["Normal"])]
+        doc.build(story)
+        await context.bot.send_document(chat_id=query.message.chat_id, document=open(pdf_path, "rb"))
+        os.remove(pdf_path)
+        await query.edit_message_text("✅ Quiz exported as PDF.", parse_mode="Markdown")
+        return
 
 async def set_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the /setmode command."""
@@ -331,14 +332,11 @@ async def set_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     mode = context.args[0].lower()
-
     if mode == "simple":
-        config.set_mode("qa")  # 'simple' is an alias for 'qa'.
+        config.set_mode("qa")
     else:
-        config.set_mode(mode)  # 'mcq' or 'custom'
-
+        config.set_mode(mode)
     await update.message.reply_text(f"✅ Mode `{mode}` set. Now send a file or image.", parse_mode="Markdown")
-
 
 async def set_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles /setprompt"""
@@ -346,14 +344,11 @@ async def set_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Please provide a prompt. Example: `/setprompt My custom prompt`", parse_mode="Markdown")
         return
     prompt_text = " ".join(context.args)
-    config.set_custom_prompt(prompt_text)  # Sets mode to custom automatically
-    await update.message.reply_text("✅ Custom prompt set.  Now send a file or image.", parse_mode="Markdown")
-
-# Replace the existing `process_text_and_generate_output` function with this updated version:
+    config.set_custom_prompt(prompt_text)
+    await update.message.reply_text("✅ Custom prompt set. Now send a file or image.", parse_mode="Markdown")
 
 async def process_text_and_generate_output(update: Update, context: ContextTypes.DEFAULT_TYPE, text_content: str):
     """Processes the extracted text and generates the quiz or output."""
-    # Use query.message for consistency, even if it's from a callback
     if update.callback_query:
         message = update.callback_query.message
     else:
@@ -371,24 +366,28 @@ async def process_text_and_generate_output(update: Update, context: ContextTypes
         output_text = ""
 
         for i, chunk in enumerate(chunks):
-            await progress_msg.edit_text(f"🔄 **Progress:** Processing chunk {i + 1}/{total_chunks}...", parse_mode="Markdown")
+            progress_bar = get_progress_bar(i + 1, total_chunks)
+            await progress_msg.edit_text(
+                f"🔄 **Progress:** {progress_bar} {(i + 1) / total_chunks * 100:.1f}% ({i + 1}/{total_chunks})...",
+                parse_mode="Markdown"
+            )
             output_text += generate_content(chunk) + "\n\n"
 
-            # Cooldown logic: Apply 30-40 seconds wait only for 'pro' models, skip for 'flash' models
-            if config.is_pro_model() and i < total_chunks - 1:  # Only wait if not the last chunk
-                wait_time = random.uniform(30, 40)  # Random wait between 30 and 40 seconds
-                await progress_msg.edit_message_text(
-                    f"⏳ **Waiting:** Chunk {i + 1}/{total_chunks} complete. Waiting {wait_time:.1f} seconds due to rate limits...",
+            if config.is_pro_model() and i < total_chunks - 1:
+                wait_time = random.uniform(30, 40)
+                await progress_msg.edit_text(
+                    f"⏳ **Waiting:** {progress_bar} {(i + 1) / total_chunks * 100:.1f}% ({i + 1}/{total_chunks}). Waiting {wait_time:.1f} seconds...",
                     parse_mode="Markdown"
                 )
                 time.sleep(wait_time)
+
+        context.user_data["last_output"] = output_text  # Store for PDF export
 
         if config.mode == "mcq":
             mcqs = parse_mcq(output_text)
             if not mcqs:
                 await progress_msg.edit_text("❌ Error parsing MCQs. Check the prompt.", parse_mode="Markdown")
                 return
-
             await progress_msg.edit_text(f"✅ **MCQ Quiz Ready!** ({len(mcqs)} questions)", parse_mode="Markdown")
             for i, mcq in enumerate(mcqs, 1):
                 logger.info(
@@ -397,15 +396,12 @@ async def process_text_and_generate_output(update: Update, context: ContextTypes
                 logger.info(
                     f"Lengths - Q: {len(mcq['question'])}, Options: {[len(opt) for opt in mcq['options']]}, E: {len(mcq['explanation'])}"
                 )
-
                 question = mcq['question'][:256]
                 options = [opt[:100] for opt in mcq['options']][:10]
                 explanation = mcq['explanation'][:1024]
-
                 if len(question) > 256 or any(len(opt) > 100 for opt in options) or len(explanation) > 1024:
                     logger.error(f"Invalid lengths in question {i}")
                     continue
-
                 try:
                     await message.reply_poll(
                         question=f"Question {i}: {question}",
@@ -430,6 +426,11 @@ async def process_text_and_generate_output(update: Update, context: ContextTypes
         elif config.mode == "custom":
             await send_formatted_custom(message, output_text, progress_msg)
 
+        # Add export option after quiz generation
+        keyboard = [[InlineKeyboardButton("Export as PDF", callback_data="export_pdf")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await message.reply_text("✅ Quiz generated! Want to export it?", reply_markup=reply_markup, parse_mode="Markdown")
+
     except Exception as e:
         logger.error(f"Quiz generation error: {e}")
         await progress_msg.edit_text(f"❌ Processing error: {e}", parse_mode="Markdown")
@@ -445,14 +446,12 @@ async def send_text_fallback(message: Update, mcq: Dict, question_number: int, e
         f"**Correct Answer:** {mcq['options'][mcq['correct']]}\n"
         f"**Explanation:** {mcq['explanation']}\n"
     )
-    # Send in chunks if too long
     if len(text_output) > 4000:
         parts = [text_output[i:i + 4000] for i in range(0, len(text_output), 4000)]
         for part in parts:
             await message.reply_text(part, parse_mode="Markdown")
     else:
         await message.reply_text(text_output, parse_mode="Markdown")
-
     await message.reply_text(
         f"⚠️ Question {question_number} was sent as text instead of a poll due to an error: {error}",
         parse_mode="Markdown",
@@ -462,7 +461,6 @@ async def send_formatted_qa(message: Update, qas: List[Dict], progress_msg):
     """Sends formatted Q&A output, handling long messages."""
     output_parts = []
     current_part = f"✅ **Simple Quiz Ready!** ({len(qas)} questions)\n\n"
-
     for i, qa in enumerate(qas, 1):
         question_block = (
             f"**Question {i}:** {qa['question']}\n"
@@ -474,56 +472,44 @@ async def send_formatted_qa(message: Update, qas: List[Dict], progress_msg):
             current_part = question_block
         else:
             current_part += question_block
-
-    if current_part:  # Append the last part
+    if current_part:
         output_parts.append(current_part)
-
     for part in output_parts:
         await message.reply_text(part, parse_mode="Markdown")
-    await progress_msg.delete()  # Clean up the progress message
+    await progress_msg.delete()
 
 async def send_formatted_custom(message, output_text: str, progress_msg):
     """Sends custom prompt output, using simple formatting."""
-
-    # Split into chunks to handle long output
     output_parts = []
     current_part = ""
-
     for line in output_text.splitlines():
-        if len(current_part) + len(line) + 1 > 4000:  # +1 for the newline
+        if len(current_part) + len(line) + 1 > 4000:
             output_parts.append(current_part)
             current_part = line + "\n"
         else:
             current_part += line + "\n"
-
     if current_part:
         output_parts.append(current_part)
     await progress_msg.edit_text("✅ **Custom Output Ready!**", parse_mode="Markdown")
-
     for part in output_parts:
-        # Basic formatting:  bold for headings, regular text otherwise.
         formatted_part = ""
         for line in part.splitlines():
-            if line.strip().endswith(":"):  # Simple heuristic for headings.
+            if line.strip().endswith(":"):
                 formatted_part += f"**{line.strip()}**\n"
             else:
                 formatted_part += f"{line.strip()}\n"
-
         await message.reply_text(formatted_part, parse_mode="Markdown")
     await progress_msg.delete()
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles file uploads (text, PDF, images)."""
-
     progress_msg = await update.message.reply_text("⏳ **Downloading file...**", parse_mode="Markdown")
     try:
         if update.message.document:
             file = update.message.document
             file_obj = await context.bot.get_file(file.file_id)
             file_path = await file_obj.download_to_drive()
-
-            text_content = ""  # Store extracted text here.
-
+            text_content = ""
             if file.mime_type == "text/plain":
                 await progress_msg.edit_text("📝 **Reading .txt file...**", parse_mode="Markdown")
                 with open(file_path, 'r', encoding='utf-8') as f:
@@ -539,33 +525,25 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"🖼️ **OCR processing page {i + 1}/{total_pages}...**", parse_mode="Markdown"
                     )
                     text_content += ocr_image(image_path) + "\n"
-                    os.remove(image_path)  # Clean up temp image
+                    os.remove(image_path)
             else:
                 await progress_msg.edit_text("❌ Unsupported file type. Please send .txt, .pdf, or .jpg/.png files.", parse_mode="Markdown")
                 os.remove(file_path)
                 return
+            os.remove(file_path)
 
-            os.remove(file_path)  # Clean up downloaded file
-
-
-        # Create the option buttons *after* OCR
         keyboard = [
             [InlineKeyboardButton("Get OCR Text", callback_data="ocr")],
             [InlineKeyboardButton("Generate MCQs", callback_data="mcq")],
             [InlineKeyboardButton("Generate Q&A", callback_data="qa")],
             [InlineKeyboardButton("Custom Prompt", callback_data="custom")]
-
         ]
-
         reply_markup = InlineKeyboardMarkup(keyboard)
-        # Store text_content in context.user_data
         context.user_data["text_content"] = text_content
-
         await update.message.reply_text(
             "✅ File processed. Choose an action:", reply_markup=reply_markup, parse_mode="Markdown"
         )
-        await progress_msg.delete()  # Clean up progress message
-
+        await progress_msg.delete()
 
     except Exception as e:
         logger.error(f"File processing error: {e}")
@@ -575,24 +553,19 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles photo uploads (performs OCR)."""
     progress_msg = await update.message.reply_text("⏳ **Downloading photo...**", parse_mode="Markdown")
     try:
-        photo = update.message.photo[-1]  # Get the largest image
+        photo = update.message.photo[-1]
         file_obj = await photo.get_file()
         file_path = await file_obj.download_to_drive()
-
         await progress_msg.edit_text("🖼️ **Performing OCR on photo...**", parse_mode="Markdown")
-        text_content = ocr_image(file_path)  # OCR the image
+        text_content = ocr_image(file_path)
         os.remove(file_path)
-        # Create the option buttons *after* OCR
         keyboard = [
             [InlineKeyboardButton("Get OCR Text", callback_data="ocr")],
             [InlineKeyboardButton("Generate MCQs", callback_data="mcq")],
             [InlineKeyboardButton("Generate Q&A", callback_data="qa")],
             [InlineKeyboardButton("Custom Prompt", callback_data="custom")]
-
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-
-        # Store text_content in context.user_data
         context.user_data["text_content"] = text_content
         await update.message.reply_text(
             "✅ Photo processed. Choose an action:",
@@ -604,7 +577,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Photo processing error: {e}")
         await progress_msg.edit_text(f"❌ Processing error: {e}", parse_mode="Markdown")
-        if os.path.exists(file_path):  # Clean up if download succeeded, but processing failed.
+        if os.path.exists(file_path):
             os.remove(file_path)
 
 async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -618,8 +591,6 @@ async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     """Main function to start the bot."""
     app = Application.builder().token("7570080066:AAGzxX9TP0V0zEwZNuFRVih8XV9goXnCssA").build()
-
-    # Register handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("setkey", set_key))
@@ -628,7 +599,7 @@ def main():
     app.add_handler(CommandHandler("setprompt", set_prompt))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(CallbackQueryHandler(button_handler))  # Single handler for *all* buttons.
+    app.add_handler(CallbackQueryHandler(button_handler))
     app.add_error_handler(error)
     app.run_polling()
 
